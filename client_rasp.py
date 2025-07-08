@@ -7,10 +7,7 @@ import os
 import json
 from dotenv import load_dotenv
 import time
-import io
 import numpy as np
-from collections import deque
-import threading
 
 # Conditional import for PiCamera
 try:
@@ -27,7 +24,7 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
 WEBSOCKET_URI = os.getenv("WEBSOCKET_URI", "ws://localhost:8000/ws")
-CHUNK = 512  # Optimized chunk size
+CHUNK = 1024
 FRAME_RATE = 15
 RESOLUTION = (640, 480)
 
@@ -36,204 +33,86 @@ BRIGHTNESS = 70
 CONTRAST = 70
 QUALITY = 85
 
-# Synchronization settings
-AUDIO_BUFFER_SIZE = 5  # Reduced buffer size
-SYNC_THRESHOLD = 0.1  # 100ms sync threshold
+# Audio buffer size for playback
+AUDIO_CHUNK_PLAYBACK = 2048
 
-class SynchronizedAudioManager:
-    """Audio manager with precise timing synchronization"""
+class PiCameraWrapper:
+    """Wrapper for efficient PiCamera capture on Raspberry Pi"""
     def __init__(self):
-        self.audio = pyaudio.PyAudio()
-        self.input_stream = None
-        self.output_stream = None
-        self.is_playing = False
-        self.audio_queue = deque(maxlen=AUDIO_BUFFER_SIZE)
-        self.playback_active = False
-        self.lock = threading.Lock()
-        self.last_audio_time = 0
-        self.audio_start_time = 0
-        
-    def initialize_streams(self):
-        """Initialize audio streams with precise timing"""
-        self.input_stream = self.audio.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RATE,
-            input=True,
-            frames_per_buffer=CHUNK,
-            start=False  # Don't start immediately
+        self.camera = PiCamera()
+        self.camera.resolution = RESOLUTION
+        self.camera.framerate = FRAME_RATE
+        self.camera.brightness = BRIGHTNESS
+        self.camera.contrast = CONTRAST
+        self.raw_capture = PiRGBArray(self.camera, size=RESOLUTION)
+        self.stream = self.camera.capture_continuous(
+            self.raw_capture, 
+            format="bgr", 
+            use_video_port=True
         )
         
-        self.output_stream = self.audio.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=24000,
-            output=True,
-            frames_per_buffer=CHUNK,
-            start=False  # Don't start immediately
-        )
-        
-    def start_recording(self):
-        """Start audio recording with timing sync"""
-        if self.input_stream and not self.input_stream.is_active():
-            self.input_stream.start_stream()
-            
-    def stop_recording(self):
-        """Stop audio recording"""
-        if self.input_stream and self.input_stream.is_active():
-            self.input_stream.stop_stream()
-            
-    def get_audio_data(self):
-        """Get audio data with overflow protection"""
-        if not self.is_playing and self.input_stream and self.input_stream.is_active():
-            try:
-                # Clear any overflow before reading
-                if self.input_stream.get_read_available() > CHUNK * 3:
-                    # Clear excess buffer to prevent overflow
-                    excess = self.input_stream.get_read_available() - CHUNK
-                    if excess > 0:
-                        self.input_stream.read(excess, exception_on_overflow=False)
-                
-                data = self.input_stream.read(CHUNK, exception_on_overflow=False)
-                return data
-            except Exception as e:
-                print(f"Audio read error: {e}")
-                return None
-        return None
-    
-    def start_playback(self):
-        """Start AI audio playback with precise timing"""
-        current_time = time.time()
-        self.is_playing = True
-        self.playback_active = True
-        self.audio_start_time = current_time
-        
-        # Stop recording during playback
-        self.stop_recording()
-        
-        if self.output_stream and not self.output_stream.is_active():
-            self.output_stream.start_stream()
-    
-    def play_audio_chunk(self, audio_data):
-        """Play audio chunk with timing control"""
-        if self.playback_active and self.output_stream and self.output_stream.is_active():
-            try:
-                self.output_stream.write(audio_data)
-                self.last_audio_time = time.time()
-            except Exception as e:
-                print(f"Audio playback error: {e}")
-    
-    def stop_playback(self):
-        """Stop AI audio playback and resume recording"""
-        self.is_playing = False
-        self.playback_active = False
-        
-        if self.output_stream and self.output_stream.is_active():
-            self.output_stream.stop_stream()
-            
-        # Small delay before resuming recording
-        time.sleep(0.05)
-        self.start_recording()
-    
-    def cleanup(self):
-        """Clean up audio resources"""
-        if self.input_stream:
-            if self.input_stream.is_active():
-                self.input_stream.stop_stream()
-            self.input_stream.close()
-        if self.output_stream:
-            if self.output_stream.is_active():
-                self.output_stream.stop_stream()
-            self.output_stream.close()
-        self.audio.terminate()
-
-class TimestampedCamera:
-    """Camera wrapper with timestamp synchronization"""
-    def __init__(self):
-        self.last_frame_time = 0
-        self.frame_interval = 1.0 / FRAME_RATE
-        
-        if USE_PICAMERA:
-            self.camera = PiCamera()
-            self.camera.resolution = RESOLUTION
-            self.camera.framerate = FRAME_RATE
-            self.camera.brightness = BRIGHTNESS
-            self.camera.contrast = CONTRAST
-            self.camera.sensor_mode = 7
-            self.raw_capture = PiRGBArray(self.camera, size=RESOLUTION)
-            self.stream = self.camera.capture_continuous(
-                self.raw_capture, 
-                format="bgr", 
-                use_video_port=True
-            )
-        else:
-            self.camera = cv2.VideoCapture(0)
-            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUTION[0])
-            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUTION[1])
-            self.camera.set(cv2.CAP_PROP_FPS, FRAME_RATE)
-            self.camera.set(cv2.CAP_PROP_BRIGHTNESS, BRIGHTNESS/100)
-            self.camera.set(cv2.CAP_PROP_CONTRAST, CONTRAST/100)
-            self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            
-    def read_frame(self):
-        """Read frame with timing control"""
-        current_time = time.time()
-        
-        # Frame rate control
-        if current_time - self.last_frame_time < self.frame_interval:
-            return False, None
-            
-        if USE_PICAMERA:
-            try:
-                frame = next(self.stream).array
-                self.raw_capture.truncate(0)
-                self.last_frame_time = current_time
-                return True, frame
-            except StopIteration:
-                return False, None
-        else:
-            ret, frame = self.camera.read()
-            if ret:
-                self.last_frame_time = current_time
-            return ret, frame
+    def read(self):
+        frame = next(self.stream).array
+        self.raw_capture.truncate(0)
+        return True, frame
     
     def release(self):
-        """Release camera resources"""
-        if USE_PICAMERA:
-            self.stream.close()
-            self.raw_capture.close()
-            self.camera.close()
-        else:
-            self.camera.release()
+        self.stream.close()
+        self.raw_capture.close()
+        self.camera.close()
 
-class OptimizedFrameEncoder:
-    """Optimized frame encoding with consistent quality"""
+class OpenCVCamera:
+    """Fallback camera for non-Raspberry Pi systems"""
     def __init__(self):
-        self.encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), QUALITY]
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUTION[0])
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUTION[1])
+        self.cap.set(cv2.CAP_PROP_FPS, FRAME_RATE)
+        self.cap.set(cv2.CAP_PROP_BRIGHTNESS, BRIGHTNESS/100)
+        self.cap.set(cv2.CAP_PROP_CONTRAST, CONTRAST/100)
         
-    def encode_frame(self, frame):
-        """Encode frame with consistent quality"""
-        # Minimal processing for consistent timing
-        frame = cv2.convertScaleAbs(frame, alpha=1.05, beta=10)
-        
-        success, jpeg = cv2.imencode('.jpg', frame, self.encode_params)
-        if not success:
-            return None
-            
-        return base64.b64encode(jpeg).decode('utf-8')
+    def read(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            return False, None
+        return True, frame
+    
+    def release(self):
+        self.cap.release()
+
+
+async def run_in_thread(func, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, func, *args)
+
+
+def encode_frame(frame):
+    """Efficient JPEG encoding"""
+    _, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), QUALITY])
+    return base64.b64encode(jpeg).decode('utf-8')
+
 
 async def send_audio_and_video(uri):
-    audio_manager = SynchronizedAudioManager()
-    camera = TimestampedCamera()
-    frame_encoder = OptimizedFrameEncoder()
-    
-    # Synchronization variables
-    last_sync_time = time.time()
-    sync_interval = 1.0  # Sync every second
-    
+    audio = pyaudio.PyAudio()
+    stream_send = audio.open(
+        format=FORMAT,
+        channels=CHANNELS,
+        rate=RATE,
+        input=True,
+        frames_per_buffer=CHUNK,
+    )
+
+    # Initialize camera
+    if USE_PICAMERA:
+        print("Using PiCamera for optimized performance")
+        camera = PiCameraWrapper()
+    else:
+        print("Using OpenCV camera")
+        camera = OpenCVCamera()
+
     print(f"Connecting to {uri}...")
     try:
-        async with websockets.connect(uri, max_size=None, ping_interval=30, ping_timeout=10) as ws:
+        async with websockets.connect(uri, max_size=None, ping_interval=None) as ws:
             print("Connected! Setting role as broadcaster...")
             await ws.send(json.dumps({"type": "set_role", "role": "broadcaster"}))
 
@@ -253,135 +132,131 @@ async def send_audio_and_video(uri):
                     print("Timeout waiting for role confirmation")
                     return
 
-            # Initialize audio and start recording
-            audio_manager.initialize_streams()
-            audio_manager.start_recording()
-            print("Starting synchronized streams...")
+            print("Starting streams...")
+            last_frame_time = time.time()
+            audio_playback_active = asyncio.Event()
+            playback_queue = asyncio.Queue()
 
-            async def send_audio():
-                """Send audio with proper timing and overflow prevention"""
-                audio_send_interval = CHUNK / RATE  # Time per chunk
-                last_send_time = time.time()
-                
+            async def play_audio_stream():
+                """Play audio chunks from the queue"""
+                stream_play = None
                 try:
                     while True:
-                        current_time = time.time()
+                        audio_data, sample_rate = await playback_queue.get()
                         
-                        # Timing control
-                        if current_time - last_send_time >= audio_send_interval:
-                            audio_data = audio_manager.get_audio_data()
-                            if audio_data:
-                                encoded = base64.b64encode(audio_data).decode("utf-8")
-                                await ws.send(json.dumps({"type": "audio", "data": encoded}))
-                                last_send_time = current_time
+                        if stream_play is None or stream_play._rate != sample_rate:
+                            if stream_play:
+                                stream_play.stop_stream()
+                                stream_play.close()
+                            stream_play = audio.open(
+                                format=FORMAT,
+                                channels=CHANNELS,
+                                rate=sample_rate,
+                                output=True,
+                                frames_per_buffer=AUDIO_CHUNK_PLAYBACK,
+                            )
                         
-                        await asyncio.sleep(0.005)  # Small sleep to prevent CPU overload
+                        # Write all data at once for low-latency playback
+                        stream_play.write(audio_data)
+                        print(f"🔊 Played {len(audio_data)} bytes of audio")
+                        playback_queue.task_done()
+                except Exception as e:
+                    print(f"Audio playback error: {e}")
+                finally:
+                    if stream_play:
+                        stream_play.stop_stream()
+                        stream_play.close()
+
+            async def send_audio():
+                """Send audio chunks with rate control"""
+                try:
+                    while True:
+                        start_time = time.time()
                         
+                        if not audio_playback_active.is_set():
+                            data = await run_in_thread(
+                                stream_send.read, CHUNK, False
+                            )
+                            encoded = base64.b64encode(data).decode("utf-8")
+                            await ws.send(json.dumps({"type": "audio", "data": encoded}))
+                        
+                        # Maintain audio rate
+                        elapsed = time.time() - start_time
+                        sleep_time = max(0, (CHUNK / RATE) - elapsed)
+                        await asyncio.sleep(sleep_time)
                 except Exception as e:
                     print(f"Audio send error: {e}")
 
             async def send_video():
-                """Send video with frame rate control"""
+                """Optimized video streaming with FPS control"""
                 try:
                     while True:
-                        success, frame = camera.read_frame()
+                        start_time = time.time()
+                        success, frame = await run_in_thread(camera.read)
                         
-                        if success:
-                            encoded = frame_encoder.encode_frame(frame)
-                            if encoded:
-                                # Send both frame types
-                                await ws.send(json.dumps({"type": "frame", "data": encoded}))
-                                await ws.send(json.dumps({"type": "frame-to-show", "data": encoded}))
+                        if not success:
+                            await asyncio.sleep(0.01)
+                            continue
+                            
+                        encoded = await run_in_thread(encode_frame, frame)
+                        await ws.send(json.dumps({"type": "frame", "data": encoded}))
                         
-                        await asyncio.sleep(0.01)  # Small sleep for responsiveness
-                        
+                        # Dynamic sleep for FPS control
+                        elapsed = time.time() - start_time
+                        sleep_time = max(0, (1.0 / FRAME_RATE) - elapsed)
+                        await asyncio.sleep(sleep_time)
                 except Exception as e:
                     print(f"Video send error: {e}")
 
             async def receive_messages():
-                """Handle incoming messages with synchronized audio playback"""
+                """Handle incoming messages from server"""
                 try:
                     while True:
-                        message = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        message = await ws.recv()
                         msg_json = json.loads(message)
                         msg_type = msg_json.get("type")
 
                         if msg_type == "audio_from_gemini":
-                            # Start synchronized playback
-                            audio_manager.start_playback()
-                            
-                            # Decode audio data
+                            audio_playback_active.set()
                             audio_data = base64.b64decode(msg_json["data"])
-                            
-                            # Calculate playback timing
                             sample_rate = msg_json.get("sample_rate", 24000)
-                            bytes_per_sample = 2  # 16-bit audio
-                            samples_per_chunk = CHUNK
-                            chunk_size = samples_per_chunk * bytes_per_sample
-                            chunk_duration = samples_per_chunk / sample_rate
-                            
-                            # Play audio in synchronized chunks
-                            for i in range(0, len(audio_data), chunk_size):
-                                chunk = audio_data[i:i+chunk_size]
-                                if len(chunk) >= chunk_size:
-                                    audio_manager.play_audio_chunk(chunk)
-                                    await asyncio.sleep(chunk_duration * 0.9)  # Slightly faster to prevent gaps
-                            
-                            # Stop playback and resume recording
-                            audio_manager.stop_playback()
-                            print("🔊 Audio playback completed")
+                            await playback_queue.put((audio_data, sample_rate))
+                            print(f"🔊 Received audio response ({len(audio_data)} bytes)")
+                            audio_playback_active.clear()
 
                         elif msg_type == "ai":
                             print(f"🤖 AI: {msg_json['data']}")
                         elif msg_type == "error":
                             print(f"❌ Error: {msg_json['data']}")
-                            
-                except asyncio.TimeoutError:
-                    # Timeout is normal, continue
-                    pass
                 except websockets.exceptions.ConnectionClosed:
                     print("WebSocket closed")
-                    break
-                except Exception as e:
-                    print(f"Receive error: {e}")
 
-            async def sync_monitor():
-                """Monitor and maintain synchronization"""
-                try:
-                    while True:
-                        await asyncio.sleep(sync_interval)
-                        
-                        # Check if audio is stuck in playback mode
-                        if audio_manager.is_playing:
-                            current_time = time.time()
-                            if current_time - audio_manager.audio_start_time > 10:  # 10 second timeout
-                                print("⚠️  Audio playback timeout, resetting...")
-                                audio_manager.stop_playback()
-                        
-                        # Sync checkpoint
-                        current_time = time.time()
-                        if current_time - last_sync_time >= sync_interval:
-                            last_sync_time = current_time
-                            
-                except Exception as e:
-                    print(f"Sync monitor error: {e}")
+            # Start audio playback task
+            playback_task = asyncio.create_task(play_audio_stream())
 
-            # Run all tasks concurrently with proper error handling
-            tasks = [
-                asyncio.create_task(send_audio()),
-                asyncio.create_task(send_video()),
-                asyncio.create_task(receive_messages()),
-                asyncio.create_task(sync_monitor())
-            ]
+            # Run all tasks concurrently
+            await asyncio.gather(
+                send_audio(),
+                send_video(),
+                receive_messages(),
+            )
             
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Cleanup
+            playback_task.cancel()
+            try:
+                await playback_task
+            except asyncio.CancelledError:
+                pass
 
     except Exception as e:
         print(f"Connection error: {e}")
     finally:
         print("Cleaning up...")
-        audio_manager.cleanup()
+        stream_send.stop_stream()
+        stream_send.close()
+        audio.terminate()
         camera.release()
+
 
 if __name__ == "__main__":
     try:
