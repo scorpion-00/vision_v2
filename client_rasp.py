@@ -8,6 +8,7 @@ import io
 import os
 import json
 from dotenv import load_dotenv
+import logging
 
 load_dotenv(override=True)
 
@@ -25,9 +26,13 @@ BRIGHTNESS = 70
 CONTRAST = 70
 QUALITY = 85
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 async def run_in_thread(func, *args, **kwargs):
-    """Run blocking function in thread pool (replacement for asyncio.to_thread)"""
+    """Run blocking function in thread pool"""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
@@ -45,26 +50,26 @@ async def send_audio_and_video(uri):
     )
 
     # Stream for playing audio received from server
-    stream_play = None  # Initialize as None, will be opened when first audio from Gemini arrives
+    stream_play = None
     is_playing_audio = asyncio.Event()
     
     # Initialize camera with improved settings
-    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        logger.error("Error: Could not open camera")
+        return
+    
+    # Configure camera properties
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUTION[0])
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUTION[1])
-    cap.set(cv2.CAP_PROP_BRIGHTNESS, BRIGHTNESS)
-    cap.set(cv2.CAP_PROP_CONTRAST, CONTRAST)
+    cap.set(cv2.CAP_PROP_BRIGHTNESS, BRIGHTNESS / 100.0)
+    cap.set(cv2.CAP_PROP_CONTRAST, CONTRAST / 100.0)
     cap.set(cv2.CAP_PROP_FPS, FRAME_RATE)
 
-    # Check if camera is working
-    if not cap.isOpened():
-        print("Error: Could not open camera")
-        return
-
-    print(f"Connecting to {uri}...")
+    logger.info(f"Connecting to {uri}...")
     try:
         async with websockets.connect(uri, max_size=None, ping_interval=None) as ws:
-            print("Connected successfully! Setting role as broadcaster...")
+            logger.info("Connected successfully! Setting role as broadcaster...")
 
             # Set role as broadcaster
             await ws.send(
@@ -83,16 +88,16 @@ async def send_audio_and_video(uri):
                     message = await asyncio.wait_for(ws.recv(), timeout=5.0)
                     msg_json = json.loads(message)
                     if msg_json.get("type") == "role_confirmed":
-                        print(f"Role confirmed: {msg_json.get('role')}")
+                        logger.info(f"Role confirmed: {msg_json.get('role')}")
                         role_confirmed = True
                     elif msg_json.get("type") == "role_error":
-                        print(f"Role error: {msg_json.get('message')}")
+                        logger.error(f"Role error: {msg_json.get('message')}")
                         return
                 except asyncio.TimeoutError:
-                    print("Timeout waiting for role confirmation")
+                    logger.error("Timeout waiting for role confirmation")
                     return
 
-            print("Starting audio/video streams...")
+            logger.info("Starting audio/video streams...")
 
             async def send_audio():
                 try:
@@ -113,7 +118,7 @@ async def send_audio_and_video(uri):
                             )
                         )
                 except Exception as e:
-                    print(f"Error in send_audio: {e}")
+                    logger.error(f"Error in send_audio: {e}")
 
             async def send_video():
                 """Send video at 1 FPS for processing"""
@@ -125,7 +130,7 @@ async def send_audio_and_video(uri):
                             continue
 
                         def encode_frame(frame_to_encode):
-                            # Convert to RGB and resize to fixed resolution
+                            # Convert to RGB and resize
                             rgb = cv2.cvtColor(frame_to_encode, cv2.COLOR_BGR2RGB)
                             img = Image.fromarray(rgb)
                             img = img.resize(RESOLUTION)
@@ -149,10 +154,10 @@ async def send_audio_and_video(uri):
                         await asyncio.sleep(1)
 
                 except Exception as e:
-                    print(f"Error in send_video: {e}")
+                    logger.error(f"Error in send_video: {e}")
 
             async def send_video_to_show():
-                """Send video at 15 FPS for display with improved quality"""
+                """Send video at 15 FPS for display"""
                 try:
                     frame_interval = 1.0 / FRAME_RATE
                     while True:
@@ -164,7 +169,7 @@ async def send_audio_and_video(uri):
                             continue
 
                         def encode_frame(frame_to_encode):
-                            # Convert to RGB and resize to fixed resolution
+                            # Convert to RGB and resize
                             rgb = cv2.cvtColor(frame_to_encode, cv2.COLOR_BGR2RGB)
                             img = Image.fromarray(rgb)
                             img = img.resize(RESOLUTION)
@@ -190,10 +195,10 @@ async def send_audio_and_video(uri):
                         await asyncio.sleep(sleep_duration)
 
                 except Exception as e:
-                    print(f"Error in send_video_to_show: {e}")
+                    logger.error(f"Error in send_video_to_show: {e}")
 
             async def receive_messages():
-                nonlocal stream_play  # Allow modification of stream_play from outer scope
+                nonlocal stream_play
                 try:
                     while True:
                         message = await ws.recv()
@@ -206,8 +211,8 @@ async def send_audio_and_video(uri):
                             audio_data_bytes = base64.b64decode(audio_data_b64)
                             sample_rate = msg_json.get(
                                 "sample_rate", 24000
-                            )  # Default if not provided
-                            audio_format = pyaudio.paInt16  # Assuming int16 as sent by server
+                            )
+                            audio_format = pyaudio.paInt16
 
                             if stream_play is None:
                                 stream_play = audio.open(
@@ -219,26 +224,28 @@ async def send_audio_and_video(uri):
 
                             await run_in_thread(stream_play.write, audio_data_bytes)
                             is_playing_audio.clear()
-                            print("🔊 Playing audio from Gemini...")
+                            logger.info("🔊 Playing audio from Gemini...")
 
                         elif msg_type == "ai":
-                            print(f"🤖 AI: {msg_json['data']}")
+                            logger.info(f"🤖 AI: {msg_json['data']}")
                         elif msg_type == "user":
-                            print(f"👤 You: {msg_json['data']}")
+                            logger.info(f"👤 You: {msg_json['data']}")
                         elif msg_type == "error":
-                            print(f"❌ Server Error: {msg_json['data']}")
+                            logger.error(f"❌ Server Error: {msg_json['data']}")
                         elif msg_type == "status":
-                            print(f"📊 Status: {msg_json}")
+                            logger.info(f"📊 Status: {msg_json}")
                         elif msg_type == "broadcaster_changed":
-                            print(f"📡 Broadcaster changed: {msg_json}")
-                        # Add more message types as needed
+                            logger.info(f"📡 Broadcaster changed: {msg_json}")
+                        elif msg_type == "frame-to-show-frontend":
+                            # This is for receivers, broadcaster doesn't need to handle
+                            pass
 
                 except websockets.exceptions.ConnectionClosedOK:
-                    print("WebSocket connection closed normally.")
+                    logger.info("WebSocket connection closed normally.")
                 except websockets.exceptions.ConnectionClosedError as e:
-                    print(f"WebSocket connection closed with error: {e}")
+                    logger.error(f"WebSocket connection closed with error: {e}")
                 except Exception as e:
-                    print(f"Error receiving message: {e}")
+                    logger.error(f"Error receiving message: {e}")
 
             # Run all tasks concurrently
             await asyncio.gather(
@@ -249,11 +256,11 @@ async def send_audio_and_video(uri):
             )
 
     except websockets.exceptions.ConnectionClosed as e:
-        print(f"Connection closed: {e}")
+        logger.error(f"Connection closed: {e}")
     except Exception as e:
-        print(f"An error occurred: {e}")
+        logger.error(f"An error occurred: {e}")
     finally:
-        print("Cleaning up resources...")
+        logger.info("Cleaning up resources...")
         if stream_send:
             stream_send.stop_stream()
             stream_send.close()
@@ -268,4 +275,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(send_audio_and_video(WEBSOCKET_URI))
     except KeyboardInterrupt:
-        print("Program interrupted by user.")
+        logger.info("Program interrupted by user.")
