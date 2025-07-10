@@ -49,7 +49,7 @@ async def send_audio_and_video(uri):
     is_playing_audio = asyncio.Event()
     
     # Initialize camera with improved settings
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUTION[0])
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUTION[1])
     cap.set(cv2.CAP_PROP_BRIGHTNESS, BRIGHTNESS)
